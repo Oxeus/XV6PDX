@@ -1,50 +1,116 @@
-xv6 is a re-implementation of Dennis Ritchie's and Ken Thompson's Unix
-Version 6 (v6).  xv6 loosely follows the structure and style of v6,
-but is implemented for a modern x86-based multiprocessor using ANSI C.
+Changes made to xv6 to facilitate projects at Portland State University.
 
-ACKNOWLEDGMENTS
+1. Access to the ''ticks'' global has been made atomic. This was
+necessary to avoid deadlock with regards to tickslock/ptable.lock,
+particularly for the sleep() routine in proc.c. Since Intel has atomic
+guarantees and GNU gcc has a suitable alignment syntax, we are able to
+do away with the tickslock everywhere. Note that a special check had
+to be put into sleep() in proc.c to handle the fact that sys_sleep()
+was changed to pass a NULL lock.
 
-xv6 is inspired by John Lions's Commentary on UNIX 6th Edition (Peer
-to Peer Communications; ISBN: 1-57398-013-7; 1st edition (June 14,
-2000)). See also https://pdos.csail.mit.edu/6.828/, which
-provides pointers to on-line resources for v6.
+The following changes were required.
 
-xv6 borrows code from the following sources:
-    JOS (asm.h, elf.h, mmu.h, bootasm.S, ide.c, console.c, and others)
-    Plan 9 (entryother.S, mp.h, mp.c, lapic.c)
-    FreeBSD (ioapic.c)
-    NetBSD (console.c)
+1a. The definition for ticks was made 32-bit aligned in trap.c.
 
-The following people have made contributions: Russ Cox (context switching,
-locking), Cliff Frey (MP), Xiao Yu (MP), Nickolai Zeldovich, and Austin
-Clements.
+// set alignment to 32-bit for ticks. See Intel® 64 and IA-32 
+// Architectures Software Developer’s Manual, Vol 3A, 8.1.1 Guaranteed
+// Atomic Operations.  
+uint ticks __attribute__ ((aligned (4)));
 
-We are also grateful for the bug reports and patches contributed by Silas
-Boyd-Wickizer, Anton Burtsev, Cody Cutler, Mike CAT, Tej Chajed, eyalz800,
-Nelson Elhage, Saar Ettinger, Alice Ferrazzi, Nathaniel Filardo, Peter
-Froehlich, Yakir Goaron,Shivam Handa, Bryan Henry, Jim Huang, Alexander
-Kapshuk, Anders Kaseorg, kehao95, Wolfgang Keller, Eddie Kohler, Austin
-Liew, Imbar Marinescu, Yandong Mao, Matan Shabtay, Hitoshi Mitake, Carmi
-Merimovich, Mark Morrissey, mtasm, Joel Nider, Greg Price, Ayan Shafqat,
-Eldar Sehayek, Yongming Shen, Cam Tenny, tyfkda, Rafael Ubal, Warren
-Toomey, Stephen Tu, Pablo Ventura, Xi Wang, Keiichi Watanabe, Nicolas
-Wolovick, wxdao, Grant Wu, Jindong Zhang, Icenowy Zheng, and Zou Chang Wei.
+1b. The lcok was removed in the code for handling the timer interrupt
+in trap.c
 
-The code in the files that constitute xv6 is
-Copyright 2006-2018 Frans Kaashoek, Robert Morris, and Russ Cox.
+  switch(tf->trapno){
+  case T_IRQ0 + IRQ_TIMER:
+    if(cpu->id == 0){
+      acquire(&tickslock);
+      ticks++;
+      release(&tickslock);
+      wakeup(&ticks);
+    }
 
-ERROR REPORTS
+changed to:
 
-Please send errors and suggestions to Frans Kaashoek and Robert Morris
-(kaashoek,rtm@mit.edu). The main purpose of xv6 is as a teaching
-operating system for MIT's 6.828, so we are more interested in
-simplifications and clarifications than new features.
+  switch(tf->trapno){
+  case T_IRQ0 + IRQ_TIMER:
+    if(cpu->id == 0){
+      atom_inc((int *)&ticks);
+      wakeup(&ticks);
+    }
 
-BUILDING AND RUNNING XV6
+1c. A new routine was added to x86.h to use the Intel atomic increment
+instruction.
 
-To build xv6 on an x86 ELF machine (like Linux or FreeBSD), run
-"make". On non-x86 or non-ELF machines (like OS X, even on x86), you
-will need to install a cross-compiler gcc suite capable of producing
-x86 ELF binaries (see https://pdos.csail.mit.edu/6.828/).
-Then run "make TOOLPREFIX=i386-jos-elf-". Now install the QEMU PC
-simulator and run "make qemu".
+// atom_inc() added to simplify handling of ticks global
+static inline void
+atom_inc(volatile int *num)
+{
+  asm volatile ( "lock incl %0" : "=m" (*num));
+}
+
+Wrappers for several other atomic Intel instructions were added for
+completeness.
+
+1d. Removed tickslock acquisition/free in sys_uptime (sysproc.c) since
+reading is now atomic.
+
+1e. All uses of tickslock (e.g., sys_sleep()) have been removed. This
+necessitated surgery on sleep() in proc.c. Calling sleep with a NULL lock
+is now legal but is limited to sys_sleep(). CAUTION
+
+2. A new feature was added to the scheduler to turn off the CPU for
+the remainder of the time slice when no work is in the ready queue.
+proc.c in routine scheduler(). The hlt() routine is in x86.h.
+
+  int idle;  // for checking if processor is idle
+
+...
+
+    idle = 1;  // assume idle unless we schedule a process
+
+...
+
+      idle = 0;  // not idle this timeslice
+
+...
+
+    release(&ptable.lock);
+    // if idle, wait for next interrupt
+    if (idle) {
+      sti();
+      hlt();
+    }
+
+3. A new user command, halt, was created to shutdown QEMU.  This is
+distinct from the hlt() function. See sys_halt() in sysproc.c.
+Function prototype added to user.h, usys.S and syscall.{hc} updated.
+
+4. A general cleanup of the Makefile to be less confusing and more
+specific to PSU.
+
+5. The array states[] in proc.c was moved out of procdump() to be
+file global. 
+
+6. Added a define in types.h to adjust the ticks per second (TPS).  This
+is useful when implementing MLFQ scheduling. See timer.c (uniprocessor)
+and lapic.c (SMP) for use.
+
+7. When TPS is other than the MIT default, we can modify trap.c to invoke
+the scheduler (via yield()) at less than the TPS frequency. This makes
+MLFQ more realistic.
+
+8. Updated atoi() in ulib.c to handle negative numbers.
+
+9. Added atoo() in ulib.c to handle ascii to octal conversion for
+project 5. Function prototype added to user.h
+
+10. Changed the procstate enum in proc.h. The purpose is to help catch
+poor programming that relies on the UNUSED state just happening to be
+0. This required that we remove the magic number in procdump() in proc.c.
+
+11. Several test suites have been added; more to come. These exist
+to assist students in testing assignments. See project descriptions
+as appropriate
+
+12. Changed all references to pid, nextpid to be uint as they should be.
+
